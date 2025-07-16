@@ -1,0 +1,3 @@
+# Requirements for Azure IP Range Extractor
+ipaddress
+requests

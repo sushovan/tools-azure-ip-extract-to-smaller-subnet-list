@@ -145,10 +145,6 @@ $RECYCLE.BIN/
 *.tar
 *.tar.gz
 *.tgz
-*.tar.bz2
-*.tbz2
-*.tar.xz
-*.txz
 *.rar
 *.7z
 *.gz

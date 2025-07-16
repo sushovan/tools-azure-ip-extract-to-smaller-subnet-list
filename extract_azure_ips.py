@@ -3,12 +3,19 @@
 Extract IP ranges from Azure Service Tags JSON file and format for WireGuard AllowedIPs
 """
 
+# Author: Sushovan (https://github.com/sushovan)
+# Date: 2025-07-16
+# Purpose: Extract Azure IP ranges for WireGuard configuration
+#
+# Project: Azure-IPs-Set
+# License: MIT
+
 import json
 import sys
 from typing import List, Set
 import ipaddress
 import os
-import urllib.request
+import requests
 
 JSON_URL = "https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20250707.json"
 JSON_FILENAME = "tmp/ServiceTags_Public.json"
@@ -89,10 +96,28 @@ def format_for_wireguard(ip_ranges: List[str], max_line_length: int = 80) -> str
     return result
 
 def ensure_json_file(json_path: str = JSON_FILENAME, url: str = JSON_URL) -> str:
-    """Download the JSON file if it does not exist locally."""
+    """Download the JSON file if it does not exist locally. Handles SSL errors gracefully."""
     if not os.path.exists(json_path):
         print(f"Downloading Azure Service Tags JSON from {url} ...")
-        urllib.request.urlretrieve(url, json_path)
+        try:
+            # First attempt with SSL verification
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            with open(json_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except requests.exceptions.SSLError:
+            print("Warning: SSL certificate verification failed. Retrying without certificate verification (not recommended for production)...")
+            # Second attempt without SSL verification
+            response = requests.get(url, stream=True, verify=False)
+            response.raise_for_status()
+            with open(json_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except requests.exceptions.RequestException as e:
+            print(f"Download failed: {e}")
+            sys.exit(1)
+
         print(f"Downloaded to {json_path}")
     else:
         print(f"Using existing JSON file: {json_path}")
