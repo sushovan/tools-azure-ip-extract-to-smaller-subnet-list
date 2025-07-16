@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  azure-ip-extractor:
+    build: .
+    volumes:
+      - ./tmp:/app/tmp
+    command: ["python", "extract_azure_ips.py"]
+

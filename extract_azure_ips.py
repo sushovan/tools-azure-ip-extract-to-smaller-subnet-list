@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+Extract IP ranges from Azure Service Tags JSON file and format for WireGuard AllowedIPs
+"""
+
+import json
+import sys
+from typing import List, Set
+import ipaddress
+import os
+import urllib.request
+
+JSON_URL = "https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20250707.json"
+JSON_FILENAME = "tmp/ServiceTags_Public.json"
+OUTPUT_FILENAME_FOR_LIST = "tmp/azure_ips.txt"
+
+def extract_ip_ranges(json_file_path: str) -> List[str]:
+    """Extract all IP ranges from Azure Service Tags JSON file"""
+    try:
+        with open(json_file_path, 'r') as f:
+            data = json.load(f)
+        
+        ip_ranges = set()
+        
+        # Extract from all service tags
+        for service in data.get('values', []):
+            service_name = service.get('name', 'Unknown')
+            address_prefixes = service.get('properties', {}).get('addressPrefixes', [])
+            
+            for prefix in address_prefixes:
+                # Only include IPv4 addresses (WireGuard supports IPv6 too, but most setups use IPv4)
+                try:
+                    network = ipaddress.ip_network(prefix, strict=False)
+                    if network.version == 4:  # IPv4 only
+                        ip_ranges.add(prefix)
+                except ValueError:
+                    # Skip invalid IP ranges
+                    continue
+        
+        return sorted(list(ip_ranges))
+    
+    except FileNotFoundError:
+        print(f"Error: File '{json_file_path}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in file '{json_file_path}'.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+def consolidate_ranges(ip_ranges: List[str]) -> List[str]:
+    """
+    Consolidate overlapping and adjacent IP ranges to reduce the list size.
+    """
+    networks = [ipaddress.ip_network(ip) for ip in ip_ranges]
+    # Collapse overlapping and adjacent networks
+    collapsed = ipaddress.collapse_addresses(networks)
+    return [str(net) for net in collapsed]
+
+def format_for_wireguard(ip_ranges: List[str], max_line_length: int = 80) -> str:
+    """Format IP ranges for WireGuard AllowedIPs"""
+    if not ip_ranges:
+        return "AllowedIPs = "
+    
+    # Join all ranges with commas
+    all_ranges = ", ".join(ip_ranges)
+    
+    # If the line is too long, break it into multiple lines
+    if len(all_ranges) + len("AllowedIPs = ") <= max_line_length:
+        return f"AllowedIPs = {all_ranges}"
+    
+    # Multi-line format
+    result = "AllowedIPs = "
+    current_line = "AllowedIPs = "
+    
+    for i, ip_range in enumerate(ip_ranges):
+        if i == 0:
+            current_line += ip_range
+        else:
+            test_line = current_line + ", " + ip_range
+            if len(test_line) <= max_line_length:
+                current_line = test_line
+            else:
+                result += current_line + ", \\\n             "
+                current_line = "             " + ip_range
+    
+    result += current_line
+    return result
+
+def ensure_json_file(json_path: str = JSON_FILENAME, url: str = JSON_URL) -> str:
+    """Download the JSON file if it does not exist locally."""
+    if not os.path.exists(json_path):
+        print(f"Downloading Azure Service Tags JSON from {url} ...")
+        urllib.request.urlretrieve(url, json_path)
+        print(f"Downloaded to {json_path}")
+    else:
+        print(f"Using existing JSON file: {json_path}")
+    return json_path
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract and consolidate Azure IP ranges for WireGuard AllowedIPs.")
+    parser.add_argument("-j", "--json_file", help="Path to Azure Service Tags JSON file", default=JSON_FILENAME)
+    parser.add_argument("-o", "--output", help="Output file for AllowedIPs list", default=OUTPUT_FILENAME_FOR_LIST)
+    args = parser.parse_args()
+
+    json_file = ensure_json_file(args.json_file)
+    ip_ranges = extract_ip_ranges(json_file)
+
+    print(f"Found {len(ip_ranges)} unique IP ranges.")
+    
+    # Option 1: Use all ranges (may be very long)
+    print("\n" + "="*80)
+    print("OPTION 1: All IP ranges (may be very long for WireGuard)")
+    print("="*80)
+    wireguard_config = format_for_wireguard(ip_ranges)
+    print(wireguard_config)
+    
+    # Option 2: Try to consolidate ranges
+    print("\n" + "="*80)
+    print("OPTION 2: Attempting to consolidate overlapping ranges")
+    print("="*80)
+    consolidated_ranges = consolidate_ranges(ip_ranges)
+    print(f"Consolidated to {len(consolidated_ranges)} ranges.")
+    wireguard_config_consolidated = format_for_wireguard(consolidated_ranges)
+    print(wireguard_config_consolidated)
+    
+    # Option 3: Show some major Azure IP blocks that might be more practical
+    print("\n" + "="*80)
+    print("OPTION 3: Major Azure IP blocks (more practical approach)")
+    print("="*80)
+    print("Consider using these major Azure IP ranges instead:")
+    option3_blocks = [
+        ipaddress.ip_network("13.0.0.0/8"),
+        ipaddress.ip_network("20.0.0.0/8"),
+        ipaddress.ip_network("40.0.0.0/8"),
+        ipaddress.ip_network("51.0.0.0/8"),
+        ipaddress.ip_network("52.0.0.0/8"),
+        ipaddress.ip_network("104.0.0.0/8"),
+    ]
+    print("AllowedIPs = " + ", ".join(str(b) for b in option3_blocks))
+    print("\nNote: This covers most Azure services but may include some non-Azure IPs.")
+    print("For maximum precision, use Option 1 or 2 above.")
+
+    # Check which Azure IPs are excluded by Option 3
+    excluded_ranges = []
+    for ipr in ip_ranges:
+        net = ipaddress.ip_network(ipr, strict=False)
+        if not any(net.subnet_of(block) for block in option3_blocks):
+            excluded_ranges.append(ipr)
+
+    print(f"\nNumber of Azure IP ranges NOT covered by Option 3: {len(excluded_ranges)}")
+    if excluded_ranges:
+        print("Sample of excluded ranges:")
+        for r in excluded_ranges[:20]:
+            print(r)
+        if len(excluded_ranges) > 20:
+            print("...")
+
+    # Save to file
+    output_file = "/Users/sushovan/Downloads/azure_wireguard_allowedips.txt"
+    with open(output_file, 'w') as f:
+        f.write("# Azure Service Tags IP Ranges for WireGuard AllowedIPs\n")
+        f.write(f"# Generated from ServiceTags_Public_20250707.json\n")
+        f.write(f"# Total ranges: {len(ip_ranges)}\n")
+        f.write(f"# Consolidated ranges: {len(consolidated_ranges)}\n\n")
+        f.write("# Option 1: All ranges\n")
+        f.write(wireguard_config + "\n\n")
+        f.write("# Option 2: Consolidated ranges\n")
+        f.write(wireguard_config_consolidated + "\n\n")
+        f.write("# Option 3: Major Azure blocks (practical approach)\n")
+        f.write("AllowedIPs = " + ", ".join(str(b) for b in option3_blocks) + "\n\n")
+        f.write(f"# {len(excluded_ranges)} Azure IP ranges NOT covered by Option 3:\n")
+        for r in excluded_ranges:
+            f.write(r + "\n")
+
+    print(f"\n\nResults saved to: {output_file}")
+
+if __name__ == "__main__":
+    main()
