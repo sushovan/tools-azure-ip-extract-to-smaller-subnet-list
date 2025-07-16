@@ -59,11 +59,80 @@ def extract_ip_ranges(json_file_path: str) -> List[str]:
 def consolidate_ranges(ip_ranges: List[str]) -> List[str]:
     """
     Consolidate overlapping and adjacent IP ranges to reduce the list size.
+    This is a lossless consolidation.
     """
     networks = [ipaddress.ip_network(ip) for ip in ip_ranges]
     # Collapse overlapping and adjacent networks
     collapsed = ipaddress.collapse_addresses(networks)
     return [str(net) for net in collapsed]
+
+def summarize_ranges(ip_ranges: List[str], max_prefix_diff: int = 2) -> List[str]:
+    """
+    Summarize a list of IP ranges into a smaller, more general list of supernets.
+    This is a lossy process, as it may include IPs not in the original list.
+
+    :param ip_ranges: A list of IP CIDR strings to summarize.
+    :param max_prefix_diff: The maximum allowed difference in prefix length
+                              to merge two networks. e.g., a value of 2 allows
+                              merging a /24 network into a /22 supernet.
+    :return: A list of summarized IP CIDR strings.
+    """
+    if not ip_ranges:
+        return []
+
+    networks = sorted([ipaddress.ip_network(ip) for ip in ip_ranges])
+    summarized_nets = []
+
+    i = 0
+    while i < len(networks):
+        current_net = networks[i]
+        group = [current_net]
+
+        # Look ahead to find networks that can be grouped together
+        j = i + 1
+        while j < len(networks):
+            next_net = networks[j]
+
+            # Try to create a supernet that covers the current group and the next network
+            group_start = group[0].network_address
+            group_end = group[-1].broadcast_address
+            next_end = next_net.broadcast_address
+
+            # Find the supernet that covers from group start to next network end
+            try:
+                candidate_supernet = list(ipaddress.summarize_address_range(group_start, next_end))[0]
+
+                # Only merge if:
+                # 1. The supernet is not too much bigger than the original networks
+                # 2. The gap between networks is reasonable
+                gap_size = int(next_net.network_address) - int(group[-1].broadcast_address) - 1
+                supernet_size = candidate_supernet.num_addresses
+                original_size = sum(net.num_addresses for net in group) + next_net.num_addresses
+
+                # Conservative merging: only merge if supernet is at most 4x the original size
+                # and the gap is not too large
+                if (candidate_supernet.prefixlen >= current_net.prefixlen - max_prefix_diff and
+                    supernet_size <= original_size * 4 and
+                    gap_size <= next_net.num_addresses):
+                    group.append(next_net)
+                    j += 1
+                else:
+                    break
+            except:
+                break
+
+        # Create the supernet for this group
+        if len(group) == 1:
+            summarized_nets.append(group[0])
+        else:
+            group_start = group[0].network_address
+            group_end = group[-1].broadcast_address
+            supernet = list(ipaddress.summarize_address_range(group_start, group_end))[0]
+            summarized_nets.append(supernet)
+
+        i = j
+
+    return [str(net) for net in summarized_nets]
 
 def format_for_wireguard(ip_ranges: List[str], max_line_length: int = 80) -> str:
     """Format IP ranges for WireGuard AllowedIPs"""
@@ -144,19 +213,28 @@ def main():
     
     # Option 2: Try to consolidate ranges
     print("\n" + "="*80)
-    print("OPTION 2: Attempting to consolidate overlapping ranges")
+    print("OPTION 2: Attempting to consolidate overlapping ranges (lossless)")
     print("="*80)
     consolidated_ranges = consolidate_ranges(ip_ranges)
     print(f"Consolidated to {len(consolidated_ranges)} ranges.")
     wireguard_config_consolidated = format_for_wireguard(consolidated_ranges)
     print(wireguard_config_consolidated)
-    
-    # Option 3: Show some major Azure IP blocks that might be more practical
+
+    # Option 3: A more aggressive, lossy summarization
     print("\n" + "="*80)
-    print("OPTION 3: Major Azure IP blocks (more practical approach)")
+    print("OPTION 3: Aggressive summarization (lossy)")
+    print("="*80)
+    summarized_ranges = summarize_ranges(consolidated_ranges, 4)
+    print(f"Summarized to {len(summarized_ranges)} ranges.")
+    wireguard_config_summarized = format_for_wireguard(summarized_ranges)
+    print(wireguard_config_summarized)
+
+    # Option 4: Show some major Azure IP blocks that might be more practical
+    print("\n" + "="*80)
+    print("OPTION 4: Major Azure IP blocks (most practical approach)")
     print("="*80)
     print("Consider using these major Azure IP ranges instead:")
-    option3_blocks = [
+    option4_blocks = [
         ipaddress.ip_network("13.0.0.0/8"),
         ipaddress.ip_network("20.0.0.0/8"),
         ipaddress.ip_network("40.0.0.0/8"),
@@ -164,18 +242,18 @@ def main():
         ipaddress.ip_network("52.0.0.0/8"),
         ipaddress.ip_network("104.0.0.0/8"),
     ]
-    print("AllowedIPs = " + ", ".join(str(b) for b in option3_blocks))
+    print("AllowedIPs = " + ", ".join(str(b) for b in option4_blocks))
     print("\nNote: This covers most Azure services but may include some non-Azure IPs.")
     print("For maximum precision, use Option 1 or 2 above.")
 
-    # Check which Azure IPs are excluded by Option 3
+    # Check which Azure IPs are excluded by Option 4
     excluded_ranges = []
     for ipr in ip_ranges:
         net = ipaddress.ip_network(ipr, strict=False)
-        if not any(net.subnet_of(block) for block in option3_blocks):
+        if not any(net.subnet_of(block) for block in option4_blocks):
             excluded_ranges.append(ipr)
 
-    print(f"\nNumber of Azure IP ranges NOT covered by Option 3: {len(excluded_ranges)}")
+    print(f"\nNumber of Azure IP ranges NOT covered by Option 4: {len(excluded_ranges)}")
     if excluded_ranges:
         print("Sample of excluded ranges:")
         for r in excluded_ranges[:20]:
@@ -184,23 +262,25 @@ def main():
             print("...")
 
     # Save to file
-    output_file = "/Users/sushovan/Downloads/azure_wireguard_allowedips.txt"
-    with open(output_file, 'w') as f:
+    with open(args.output, 'w') as f:
         f.write("# Azure Service Tags IP Ranges for WireGuard AllowedIPs\n")
-        f.write(f"# Generated from ServiceTags_Public_20250707.json\n")
+        f.write(f"# Generated from {args.json_file}\n")
         f.write(f"# Total ranges: {len(ip_ranges)}\n")
-        f.write(f"# Consolidated ranges: {len(consolidated_ranges)}\n\n")
+        f.write(f"# Consolidated ranges (lossless): {len(consolidated_ranges)}\n")
+        f.write(f"# Summarized ranges (lossy): {len(summarized_ranges)}\n\n")
         f.write("# Option 1: All ranges\n")
         f.write(wireguard_config + "\n\n")
-        f.write("# Option 2: Consolidated ranges\n")
+        f.write("# Option 2: Consolidated ranges (lossless)\n")
         f.write(wireguard_config_consolidated + "\n\n")
-        f.write("# Option 3: Major Azure blocks (practical approach)\n")
-        f.write("AllowedIPs = " + ", ".join(str(b) for b in option3_blocks) + "\n\n")
-        f.write(f"# {len(excluded_ranges)} Azure IP ranges NOT covered by Option 3:\n")
+        f.write("# Option 3: Aggressive summarization (lossy)\n")
+        f.write(wireguard_config_summarized + "\n\n")
+        f.write("# Option 4: Major Azure blocks (practical approach)\n")
+        f.write("AllowedIPs = " + ", ".join(str(b) for b in option4_blocks) + "\n\n")
+        f.write(f"# {len(excluded_ranges)} Azure IP ranges NOT covered by Option 4:\n")
         for r in excluded_ranges:
             f.write(r + "\n")
 
-    print(f"\n\nResults saved to: {output_file}")
+    print(f"\n\nResults saved to: {args.output}")
 
 if __name__ == "__main__":
     main()
